@@ -167,7 +167,7 @@ int _egc_gc_process_events(egc_event_cb event_handler)
                                        trigger_value(s_pad[i].triggerR));
             count++;
         } else if (err == PAD_ERR_NO_CONTROLLER) {
-            resetBits |= (PAD_CHAN0_BIT >> i);
+            resetBits |= PAD_CHAN_BIT(i);
         }
     }
 
