@@ -1,12 +1,11 @@
 #include <assert.h>
 #include <ogc/machine/processor.h>
+#include <ogc/message.h>
 #include <ogc/system.h>
+#include <ogc/timesupp.h>
 #include <ogc/usb.h>
 #include <stdio.h>
 #include <string.h>
-#include <tuxedo/mailbox.h>
-#include <tuxedo/ppc/clock.h>
-#include <tuxedo/tick.h>
 
 #ifdef WITH_BLUETOOTH
 #include <bt-embedded/backends/wii.h>
@@ -47,7 +46,7 @@ typedef struct {
         // TODO: add bluetooth data here
     };
     egc_input_state_t next_input;
-    KTickTask timer_task;
+    syswd_t timer_id;
     egc_timer_cb timer_callback;
 } wii_device_t;
 
@@ -73,14 +72,13 @@ typedef enum {
 
 static wii_device_t s_devices[MAX_ACTIVE_DEVICES] ATTRIBUTE_ALIGN(32);
 static wii_transfer_t s_transfers[MAX_ACTIVE_TRANSFERS] ATTRIBUTE_ALIGN(32);
-static KMailbox s_worker_queue;
-static uptr s_worker_queue_slots[10];
+static mqbox_t s_worker_queue = MQ_BOX_NULL;
 static egc_event_cb s_event_handler;
 
 static void wii_device_free(wii_device_t *device);
 static int update_device_list(void);
-#define MSG_UPDATE_DEVICES_LIST ((uptr)update_device_list)
-#define MSG_FROM_TRANSFER(t)    ((uptr)t)
+#define MSG_UPDATE_DEVICES_LIST ((mqmsg_t)update_device_list)
+#define MSG_FROM_TRANSFER(t)    ((mqmsg_t)t)
 
 static inline wii_device_t *wii_device_from_input_device(egc_input_device_t *input_device)
 {
@@ -136,7 +134,7 @@ static s32 wii_transfer_cb(s32 result, void *userdata)
         transfer->t.status = EGC_USB_TRANSFER_STATUS_ERROR;
         transfer->t.length = 0;
     }
-    KMailboxTrySend(&s_worker_queue, MSG_FROM_TRANSFER(transfer));
+    MQ_Send(s_worker_queue, MSG_FROM_TRANSFER(transfer), MQ_MSG_NOBLOCK);
     return result;
 }
 
@@ -231,23 +229,33 @@ static void wii_bt_device_free(egc_input_device_t *input_device)
 
 /* This is called from an interrupt: do nothing in here, just send the event to
  * the worker thread */
-static void timer_cb(KTickTask *timer)
+static void timer_cb(syswd_t timer_id, void *userdata)
 {
-    KMailboxTrySend(&s_worker_queue, (uptr)timer);
+    wii_device_t *device = userdata;
+    MQ_Send(s_worker_queue, (mqmsg_t)&device->timer_id, MQ_MSG_NOBLOCK);
+}
+
+static void us_to_timespec(int time_us, struct timespec *ts)
+{
+    ts->tv_sec = time_us / TB_USPERSEC;
+    ts->tv_nsec = (time_us % TB_USPERSEC) * TB_NSPERUS;
 }
 
 static int wii_set_timer(egc_input_device_t *input_device, int time_us, int repeat_time_us,
                          egc_timer_cb callback)
 {
     wii_device_t *device = (wii_device_t *)input_device;
+    struct timespec time0, time1;
 
-    if (device->timer_task.fn != NULL) {
-        KTickTaskStop(&device->timer_task);
+    if (device->timer_id != SYS_WD_NULL) {
+        SYS_CancelAlarm(device->timer_id);
+    } else {
+        SYS_CreateAlarm(&device->timer_id);
     }
 
-    u64 timeout_ticks = PPCUsToTicks(time_us);
-    u64 period_ticks = (repeat_time_us > 0) ? PPCUsToTicks(repeat_time_us) : 0;
-    KTickTaskStart(&device->timer_task, timer_cb, timeout_ticks, period_ticks);
+    us_to_timespec(time_us, &time0);
+    us_to_timespec(repeat_time_us, &time1);
+    SYS_SetPeriodicAlarm(device->timer_id, &time0, &time1, timer_cb, device);
     device->timer_callback = callback;
     return 0;
 }
@@ -290,7 +298,7 @@ static void wii_device_free(wii_device_t *device)
  * the worker thread */
 int change_notify_cb(int result, void *userdata)
 {
-    KMailboxTrySend(&s_worker_queue, MSG_UPDATE_DEVICES_LIST);
+    MQ_Send(s_worker_queue, MSG_UPDATE_DEVICES_LIST, MQ_MSG_NOBLOCK);
     return result;
 }
 
@@ -369,7 +377,7 @@ static int update_device_list(void)
         }
 
         /* We have ownership, populate the device info */
-        memset(&device->timer_task, 0, sizeof(device->timer_task));
+        device->timer_id = SYS_WD_NULL;
         device->timer_callback = NULL;
         PUB(device)->connection = EGC_CONNECTION_USB;
 
@@ -382,39 +390,22 @@ static int update_device_list(void)
     return 0;
 }
 
-static void process_events_timeout(KTickTask *)
-{
-    KMailboxTrySend(&s_worker_queue, (uptr)process_events_timeout);
-}
-
 static int process_events(u32 timeout_us)
 {
     bool done = false;
     int count = 0;
 
-    KTickTask timer;
-    if (timeout_us != 0) {
-        u64 timeout_ticks = PPCUsToTicks(timeout_us);
-        KTickTaskStart(&timer, process_events_timeout, timeout_ticks, 0);
-    }
-
     while (!done) {
-        uptr message;
-
-        if (!KMailboxTryRecv(&s_worker_queue, &message)) {
-            if (timeout_us != 0) {
-                message = KMailboxRecv(&s_worker_queue);
-                done = true;
-            } else {
-                break;
-            }
+        mqmsg_t message;
+        struct timespec ts;
+        us_to_timespec(timeout_us, &ts);
+        if (!MQ_TimedReceive(s_worker_queue, &message, &ts)) {
+            break;
         }
 
         if (message == MSG_UPDATE_DEVICES_LIST) {
             count++;
             update_device_list();
-        } else if (message == (uptr)process_events_timeout) {
-            done = true;
         } else if (message >= MSG_FROM_TRANSFER(&s_transfers[0]) &&
                    message <= MSG_FROM_TRANSFER(&s_transfers[ARRAY_SIZE(s_transfers) - 1])) {
             count++;
@@ -439,12 +430,13 @@ static int process_events(u32 timeout_us)
                 wii_device_t *device = &s_devices[i];
                 if (PUB(device)->connection == EGC_CONNECTION_DISCONNECTED)
                     continue;
-                if (message == (uptr)&device->timer_task) {
+                if (message == (mqmsg_t)&device->timer_id) {
                     count++;
                     EGC_DEBUG("timer on %p", device);
                     bool keep = device->timer_callback(PUB(device));
                     if (!keep) {
-                        KTickTaskStop(&device->timer_task);
+                        SYS_RemoveAlarm(device->timer_id);
+                        device->timer_id = SYS_WD_NULL;
                     }
                     found = true;
                     break;
@@ -456,10 +448,6 @@ static int process_events(u32 timeout_us)
             }
 #endif
         }
-    }
-
-    if (timeout_us != 0) {
-        KTickTaskStop(&timer);
     }
     return count;
 }
@@ -474,13 +462,13 @@ static int wii_init(egc_event_cb event_handler)
     if (rc != USB_OK)
         return -1;
 
-    KMailboxPrepare(&s_worker_queue, s_worker_queue_slots, ARRAY_SIZE(s_worker_queue_slots));
+    MQ_Init(&s_worker_queue, 10);
 
     for (int i = 0; i < ARRAY_SIZE(s_devices); i++)
         PUB(&s_devices[i])->connection = EGC_CONNECTION_DISCONNECTED;
 
 #if WITH_BLUETOOTH
-    bte_backend_wii_set_mailbox(&s_worker_queue);
+    bte_backend_wii_set_mailbox(s_worker_queue);
 #endif
     return update_device_list();
 }

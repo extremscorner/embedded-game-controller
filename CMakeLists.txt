@@ -53,7 +53,7 @@ add_compile_options(
 
 if(WITH_BLUETOOTH)
     set(BUILD_EXAMPLE OFF CACHE BOOL "Build example program" FORCE)
-    add_subdirectory(bt-embedded)
+    add_subdirectory(bt-embedded EXCLUDE_FROM_ALL)
     link_libraries(bt-embedded)
     include_directories(${CMAKE_SOURCE_DIR}/bt-embedded)
     add_definitions(-DWITH_BLUETOOTH=1)
