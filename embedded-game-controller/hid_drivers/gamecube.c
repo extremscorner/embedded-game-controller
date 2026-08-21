@@ -126,7 +126,8 @@ int _egc_gc_process_events(egc_event_cb event_handler)
         egc_input_device_t *input_device = PUB(device);
         bool was_connected = input_device->connection != EGC_CONNECTION_DISCONNECTED;
         s8 err = s_pad[i].err;
-        bool connected = err == PAD_ERR_NONE || (was_connected && err != PAD_ERR_NO_CONTROLLER);
+        bool connected = (err == PAD_ERR_NONE && !PAD_IsBarrel(i)) ||
+                         (was_connected && err != PAD_ERR_NO_CONTROLLER);
         if (connected != was_connected) {
             if (connected) {
                 input_device->connection = EGC_CONNECTION_SERIAL;
@@ -144,7 +145,7 @@ int _egc_gc_process_events(egc_event_cb event_handler)
             count++;
         }
 
-        if (err == PAD_ERR_NONE) {
+        if (connected && err == PAD_ERR_NONE) {
             /* We don't use egc_device_driver_report_input(), since we know we
              * are running in the main EGC thread and can modify the fields
              * directly */
