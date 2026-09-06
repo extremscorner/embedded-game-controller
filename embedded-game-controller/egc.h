@@ -21,6 +21,7 @@ typedef enum ATTRIBUTE_PACKED {
     EGC_DEVICE_TYPE_GAMEPAD,
     EGC_DEVICE_TYPE_GUITAR,
     EGC_DEVICE_TYPE_DRUMS,
+    EGC_DEVICE_TYPE_BALANCE_BOARD,
 } egc_device_type_e;
 static_assert(sizeof(egc_device_type_e) == 1);
 
